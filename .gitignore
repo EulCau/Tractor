@@ -1,0 +1,13 @@
+build/
+bin/
+libs/
+Tmp/
+libtorch support/
+Eigen/
+__pycache__/
+.vscode/
+.vs/
+.idea/
+.venv/
+
+Thumbs.db
