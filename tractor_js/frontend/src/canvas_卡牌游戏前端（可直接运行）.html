@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Canvas 卡牌游戏前端 Demo</title>
+  <style>
+    html, body { height: 100%; margin: 0; background:#0d0f13; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, PingFang SC, Noto Sans CJK SC, "Microsoft YaHei", Arial, sans-serif; color:#e6e9ef; }
+    #wrap { display:flex; height:100%; }
+    #leftPanel { width: 300px; min-width: 260px; max-width: 360px; border-right:1px solid #242833; padding:12px; box-sizing:border-box; background:#10131a; }
+    #leftPanel h1 { font-size:16px; margin:0 0 6px 0; font-weight:700; letter-spacing:.5px; }
+    #leftPanel .row { margin:8px 0; }
+    #leftPanel button { cursor:pointer; background:#1b2332; color:#e6e9ef; border:1px solid #2a3346; border-radius:10px; padding:8px 10px; margin:4px 2px; }
+    #leftPanel button:active { transform: translateY(1px); }
+    #log { height: 40vh; overflow:auto; font-size:12px; background:#0f1218; border:1px solid #222838; border-radius:8px; padding:6px; }
+    #rightPanel { flex:1; position:relative; }
+    #game { width:100%; height:100%; display:block; background:#0b0e13; }
+    .tip { font-size:12px; color:#a6adbb; }
+    .small { font-size:12px; opacity:.85; }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <div id="leftPanel">
+    <h1>服务器模拟 / 调整</h1>
+    <div class="row small">画布大小会随窗口自适应。</div>
+
+    <div class="row">
+      <button onclick="mockSeatMsg()">发送座次消息</button>
+      <button onclick="nextTurn()">下一位出牌权</button>
+      <button onclick="dealToMe()">发我两张牌</button>
+    </div>
+
+    <div class="row">
+      <button onclick="mockOthersPlay()">他人随机出牌 → 处理区</button>
+      <button onclick="mockRoundResolve()">结算一轮</button>
+    </div>
+
+    <div class="row">
+      <button onclick="toggleSharedScore()">查看中间得分区</button>
+      <button onclick="shuffleMyHand()">整理/洗我的手牌</button>
+    </div>
+
+    <div class="row tip">交互：
+      <ul class="small">
+        <li>鼠标移过自己的手牌：高亮（出牌阶段才可点击）。</li>
+        <li>点击某人的弃牌区：弹出小窗查看其所有弃牌。</li>
+        <li>点击某人的个人得分区/处理区/中间得分区：弹出查看。</li>
+      </ul>
+    </div>
+
+    <div class="row">
+      <div id="log"></div>
+    </div>
+  </div>
+  <div id="rightPanel">
+    <canvas id="game"></canvas>
+  </div>
+</div>
+
+<script>
+// ===================== 工具函数 =====================
+const PRIMES = [73856093, 19349663, 83492791, 2654435761];
+function hashColorFromName(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 131 + name.charCodeAt(i)) >>> 0;
+  const big = (h * PRIMES[3]) >>> 0;
+  const rgb = big % 0xFFFFFF;
+  const r = (rgb >> 16) & 255, g = (rgb >> 8) & 255, b = rgb & 255;
+  // 提高亮度，避免太暗
+  const brighten = (x) => Math.min(255, (x + 255) / 2);
+  return `rgb(${brighten(r)|0}, ${brighten(g)|0}, ${brighten(b)|0})`;
+}
+function log(msg) {
+  const el = document.getElementById('log');
+  const time = new Date().toLocaleTimeString();
+  el.innerHTML = `<div>[${time}] ${msg}</div>` + el.innerHTML;
+}
+
+// ===================== 数据结构 =====================
+const state = {
+  players: [],              // {id, name, avatarColor}
+  seatOrder: [],            // player ids 按逆时针
+  me: null,                 // my player id
+  currentTurn: null,        // player id
+  // 区域牌：按玩家
+  hands: new Map(),         // id -> [Card]
+  process: new Map(),       // id -> [Card]
+  discards: new Map(),      // id -> [Card]
+  personalScores: new Map(),// id -> [Card]
+  sharedScore: [],          // 中间公共得分
+  overlay: null,            // {title, cards} or null
+};
+
+// 牌面与几何设置（会随尺寸自适应）
+const geo = {
+  cardW: 70, cardH: 100, radius: 10,
+  smallW: 48, smallH: 68,
+  padding: 12,
+};
+
+// 生成一张简约牌（示例：花色+点数）
+const SUITS = ['♠','♥','♦','♣'];
+const RANKS = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+function makeCard(suit, rank){ return {suit, rank, id:`${suit}${rank}-${Math.random().toString(36).slice(2,7)}`}; }
+function randomCard(){ return makeCard(SUITS[Math.floor(Math.random()*4)], RANKS[Math.floor(Math.random()*13)]); }
+
+// ===================== 画布与背景花纹 =====================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = 800, H = 600;
+
+function resize() {
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  const rect = canvas.getBoundingClientRect();
+  W = rect.width; H = rect.height;
+  canvas.width = W * dpr; canvas.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// 背景花纹：暗色棋盘+柔光网格
+function drawBackground() {
+  // 渐变底
+  const grad = ctx.createLinearGradient(0,0,W,H);
+  grad.addColorStop(0, '#0b0f17');
+  grad.addColorStop(1, '#0a0d14');
+  ctx.fillStyle = grad; ctx.fillRect(0,0,W,H);
+
+  // 细网格
+  ctx.globalAlpha = 0.06; ctx.strokeStyle = '#cdd6f4';
+  const step = 32;
+  ctx.lineWidth = 1;
+  for (let x = step; x < W; x += step) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for (let y = step; y < H; y += step) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+  ctx.globalAlpha = 1;
+}
+
+// ===================== 布局：座次与区域 =====================
+// 逆时针排列。自己的头像在右下角；相邻两位在左右偏上；其余全在顶部，左右留白自适应
+function computeSeatPositions() {
+  const positions = new Map(); // id -> {x,y}
+  if (!state.me || state.seatOrder.length === 0) return positions;
+
+  const meIdx = state.seatOrder.indexOf(state.me);
+  const n = state.seatOrder.length;
+
+  // 布局点
+  const marginTop = 28; // 顶部留白
+  const sideY = H * 0.28; // 左右中间偏上
+  const meX = W * 0.82, meY = H * 0.84;
+
+  // 顶部剩余的人数 = n - 3（我 + 左邻 + 右邻）
+  const leftNeighbor = state.seatOrder[(meIdx + 1) % n];
+  const rightNeighbor = state.seatOrder[(meIdx - 1 + n) % n];
+  const topIds = [];
+  for (let k = 0; k < n; k++) {
+    const id = state.seatOrder[k];
+    if (id !== state.me && id !== leftNeighbor && id !== rightNeighbor) topIds.push(id);
+  }
+
+  // 顶部自适应分布：两边留白 6% - 10%
+  const leftPad = Math.max(40, W * 0.06);
+  const rightPad = Math.max(40, W * 0.06);
+  const topAreaW = W - leftPad - rightPad;
+  const topY = marginTop;
+  const step = topIds.length > 1 ? topAreaW / (topIds.length - 1) : 0;
+
+  // 放置位置
+  positions.set(state.me, { x: meX, y: meY });
+  positions.set(leftNeighbor, { x: W * 0.12, y: sideY });
+  positions.set(rightNeighbor, { x: W * 0.88, y: sideY });
+  for (let i = 0; i < topIds.length; i++) {
+    const x = leftPad + i * step;
+    positions.set(topIds[i], { x, y: topY });
+  }
+  return positions;
+}
+
+// 中央“每人三堆（弃牌/处理/个人得分）”区域：按座次自上而下堆叠
+function computeCenterRows() {
+  const rows = new Map(); // id -> {x,y}
+  if (state.seatOrder.length === 0) return rows;
+  const rowH = geo.smallH + 12;
+  const totalH = state.seatOrder.length * rowH;
+  const startY = (H * 0.5 - totalH / 2) | 0;
+  const centerX = (W / 2) | 0;
+  state.seatOrder.forEach((id, idx) => {
+    const y = startY + idx * rowH;
+    rows.set(id, { x: centerX, y });
+  });
+  return rows;
+}
+
+// ===================== 绘制元素 =====================
+function roundRect(x,y,w,h,r){
+  const rr = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+rr, y);
+  ctx.arcTo(x+w, y, x+w, y+h, rr);
+  ctx.arcTo(x+w, y+h, x, y+h, rr);
+  ctx.arcTo(x, y+h, x, y, rr);
+  ctx.arcTo(x, y, x+w, y, rr);
+  ctx.closePath();
+}
+
+function drawAvatar(p, pos) {
+  const size = 56;
+  const x = pos.x - size/2, y = pos.y - size/2;
+  // 卡片背景
+  ctx.fillStyle = '#0f1420'; roundRect(x-6,y-6,size+12,size+32,12); ctx.fill();
+  // 头像圆
+  ctx.beginPath(); ctx.arc(pos.x, pos.y, size/2, 0, Math.PI*2);
+  ctx.fillStyle = p.avatarColor; ctx.fill();
+  // 名字
+  ctx.fillStyle = '#d0d6e6'; ctx.font = '12px ui-sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText(p.name, pos.x, y + size + 4, size+20);
+}
+
+function drawCardFace(x,y,w,h,card,emph=false) {
+  roundRect(x,y,w,h,8);
+  ctx.fillStyle = emph ? '#f8fafc' : '#e6e9f2'; ctx.fill();
+  ctx.strokeStyle = emph ? '#7c3aed' : '#1f2937'; ctx.lineWidth = emph ? 3 : 1.25; ctx.stroke();
+  const suit = card.suit, rank = card.rank;
+  ctx.fillStyle = (suit==='♥' || suit==='♦') ? '#e11d48' : '#111827';
+  ctx.font = `${Math.max(12, w*0.22)|0}px ui-sans-serif`;
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText(rank, x+6, y+4);
+  ctx.textAlign='right'; ctx.textBaseline='bottom';
+  ctx.fillText(suit, x+w-6, y+h-4);
+}
+function drawCardBack(x,y,w,h) {
+  roundRect(x,y,w,h,8);
+  const grad = ctx.createLinearGradient(x,y,x+w,y+h);
+  grad.addColorStop(0,'#1b2332'); grad.addColorStop(1,'#273149');
+  ctx.fillStyle = grad; ctx.fill();
+  ctx.strokeStyle = '#394868'; ctx.lineWidth = 1.25; ctx.stroke();
+  ctx.globalAlpha = 0.35; ctx.fillStyle = '#cbd5e1';
+  const pad = 8;
+  for(let yy=y+pad; yy<y+h-pad; yy+=6){ ctx.fillRect(x+pad, yy, w-2*pad, 1); }
+  ctx.globalAlpha = 1;
+}
+
+// 区域绘制（叠放 / 摊开 / 小堆计数）
+function drawFanHand(cards, baseX, baseY, faceUp=true, active=false){
+  const w = geo.cardW, h = geo.cardH;
+  const spacing = Math.min(w*0.7, Math.max(22, (W*0.36)/(cards.length+1)));
+  // 记录可交互矩形
+  interactiveRects.length = 0;
+  for (let i=0;i<cards.length;i++){
+    const x = baseX + i*spacing, y = baseY - (active ? Math.sin(i/cards.length*Math.PI)*8 : 0);
+    const hovered = (hoverTarget && hoverTarget.type==='my-hand' && hoverTarget.index===i);
+    const emph = active && hovered;
+    if (faceUp) drawCardFace(x,y,w,h,cards[i],emph); else drawCardBack(x,y,w,h);
+    interRect({x,y,w,h,type:'my-hand', index:i, card:cards[i]});
+  }
+}
+function drawStackSmall(label, cards, x, y, key){
+  const w = geo.smallW, h = geo.smallH;
+  // 框
+  roundRect(x-8, y-6, w+16, h+28, 10);
+  ctx.fillStyle = '#0e1420'; ctx.fill();
+  ctx.strokeStyle = '#2a3346'; ctx.stroke();
+  // 背面叠放
+  const overlap = 10;
+  for (let i=0;i<Math.min(cards.length, 3); i++){
+    drawCardBack(x+i*4, y+i*3, w, h);
+  }
+  // 数量与标签
+  ctx.fillStyle = '#cbd5e1'; ctx.font = '11px ui-sans-serif'; ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText(`${label} (${cards.length})`, x-4, y+h+6);
+  // 交互（点击查看）
+  interRect({x:x-8, y:y-6, w:w+16, h:h+28, type:'pile', key});
+}
+
+function drawCenterPerPlayerRows(rows){
+  // 每位： [弃牌] [处理] [个人得分]
+  const gap = 54;
+  state.seatOrder.forEach((id) => {
+    const row = rows.get(id); if (!row) return;
+    const leftX = row.x - geo.smallW - gap; // 弃牌
+    drawStackSmall('弃牌', state.discards.get(id)||[], leftX, row.y, {kind:'discard', id});
+    // 处理区
+    drawStackSmall('处理', state.process.get(id)||[], row.x - geo.smallW/2, row.y, {kind:'process', id});
+    // 个人得分
+    const rightX = row.x + gap;
+    drawStackSmall('得分', state.personalScores.get(id)||[], rightX, row.y, {kind:'personal', id});
+  });
+}
+
+function drawSharedScore(){
+  const cards = state.sharedScore;
+  const x = (W/2 - geo.smallW/2) | 0;
+  const y = (H*0.5 + state.seatOrder.length*(geo.smallH+12)/2 + 16) | 0;
+  drawStackSmall('中间得分', cards, x, y, {kind:'shared'});
+}
+
+// 叠放在头像旁边（他人手牌）
+function drawOtherPlayerStacks(seatPos){
+  const w = geo.smallW, h = geo.smallH; const offset = 14;
+  state.seatOrder.forEach(id => {
+    if (id === state.me) return;
+    const pos = seatPos.get(id); if (!pos) return;
+    const isTop = pos.y < H*0.2;
+    const baseX = pos.x + (isTop ? -w/2 : w*0.6);
+    const baseY = pos.y + (isTop ? h*0.55 : -h/2);
+    const cards = state.hands.get(id) || [];
+    // 只显示背面叠放
+    for (let i=0;i<Math.min(cards.length, 3); i++) drawCardBack(baseX + i*offset, baseY + i*offset, w, h);
+  });
+}
+
+// 头像与名字
+function drawSeats(seatPos){
+  state.seatOrder.forEach(id => {
+    const pos = seatPos.get(id); if (!pos) return;
+    const p = state.players.find(pp=>pp.id===id);
+    drawAvatar(p, pos);
+    // 回合标记
+    if (state.currentTurn === id){
+      ctx.fillStyle = '#22d3ee'; ctx.font = '12px ui-sans-serif'; ctx.textAlign='center'; ctx.textBaseline='bottom';
+      ctx.fillText('出牌阶段', pos.x, pos.y - 38);
+    }
+  });
+}
+
+// 我的手牌（正面、可互动），位于屏幕下方头像左侧
+function drawMyHand(seatPos){
+  const pos = seatPos.get(state.me); if (!pos) return;
+  const hand = state.hands.get(state.me) || [];
+  const baseY = Math.min(H - geo.cardH - 12, pos.y - geo.cardH/2);
+  const baseX = Math.max(12, pos.x - geo.cardW - Math.min(W*0.5, 520));
+  const active = state.currentTurn === state.me;
+  drawFanHand(hand, baseX, baseY, true, active);
+}
+
+// 弹出层查看牌列表
+function drawOverlay(){
+  if (!state.overlay) return;
+  const {title, cards} = state.overlay;
+  ctx.globalAlpha = .85; ctx.fillStyle = '#0b0f14'; ctx.fillRect(0,0,W,H); ctx.globalAlpha = 1;
+  const boxW = Math.min(860, W-80), boxH = Math.min(420, H-120);
+  const x = (W-boxW)/2, y=(H-boxH)/2;
+  roundRect(x,y,boxW,boxH,16); ctx.fillStyle = '#0f1420'; ctx.fill(); ctx.strokeStyle='#2a3346'; ctx.stroke();
+  ctx.fillStyle = '#e6e9ef'; ctx.font = '16px ui-sans-serif'; ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText(title, x+16, y+12);
+  // 网格排布正面展示
+  const pad = 16; const cols = Math.max(1, Math.floor((boxW-2*pad)/(geo.smallW+10)));
+  for (let i=0;i<cards.length;i++){
+    const col = i % cols, row = (i/cols)|0;
+    const cx = x + pad + col*(geo.smallW+10);
+    const cy = y + 40 + row*(geo.smallH+12);
+    drawCardFace(cx, cy, geo.smallW, geo.smallH, cards[i]);
+  }
+  // 关闭提示
+  ctx.fillStyle = '#a6adbb'; ctx.font = '12px ui-sans-serif'; ctx.textAlign='right'; ctx.textBaseline='bottom';
+  ctx.fillText('点击空白关闭', x+boxW-12, y+boxH-10);
+}
+
+// ===================== 交互命中检测 =====================
+const interactiveRects = []; // {x,y,w,h,type,...}
+function interRect(r){ interactiveRects.push(r); }
+let hoverTarget = null;
+
+canvas.addEventListener('mousemove', (e)=>{
+  const {left, top} = canvas.getBoundingClientRect();
+  const mx = e.clientX - left, my = e.clientY - top;
+  hoverTarget = null;
+  // 仅当自己出牌阶段，才检测手牌高亮
+  if (state.currentTurn === state.me){
+    const hand = state.hands.get(state.me)||[];
+    for (let i=interactiveRects.length-1;i>=0;i--){
+      const r = interactiveRects[i]; if (r.type !== 'my-hand') continue;
+      if (mx>=r.x && mx<=r.x+r.w && my>=r.y && my<=r.y+r.h){ hoverTarget = r; break; }
+    }
+  }
+});
+
+canvas.addEventListener('click', (e)=>{
+  const {left, top} = canvas.getBoundingClientRect();
+  const mx = e.clientX - left, my = e.clientY - top;
+  if (state.overlay){ state.overlay = null; return; }
+  // piles 点击
+  for (let i=interactiveRects.length-1;i>=0;i--){
+    const r = interactiveRects[i];
+    if (mx>=r.x && mx<=r.x+r.w && my>=r.y && my<=r.y+r.h){
+      if (r.type==='pile'){
+        const k = r.key;
+        if (k.kind==='shared')
+          state.overlay = {title:'中间得分区', cards:[...state.sharedScore]};
+        else if (k.kind==='discard')
+          state.overlay = {title:`玩家 ${getName(k.id)} 的弃牌`, cards:[...(state.discards.get(k.id)||[])]};
+        else if (k.kind==='process')
+          state.overlay = {title:`玩家 ${getName(k.id)} 的处理区`, cards:[...(state.process.get(k.id)||[])]};
+        else if (k.kind==='personal')
+          state.overlay = {title:`玩家 ${getName(k.id)} 的个人得分`, cards:[...(state.personalScores.get(k.id)||[])]};
+        return;
+      }
+      // 我的手牌出牌
+      if (r.type==='my-hand' && state.currentTurn === state.me){
+        playCardFromHand(r.index);
+        return;
+      }
+    }
+  }
+});
+
+// ===================== 渲染循环 =====================
+function render(){
+  // 自适应卡片大小（随窗口缩放）
+  const base = Math.max(60, Math.min(94, Math.floor(W/18)));
+  geo.cardW = base; geo.cardH = Math.floor(base*1.4);
+  geo.smallW = Math.floor(base*0.68); geo.smallH = Math.floor(base*0.95);
+
+  drawBackground();
+  const seatPos = computeSeatPositions();
+  drawSeats(seatPos);
+  drawOtherPlayerStacks(seatPos);
+  drawMyHand(seatPos);
+  const rows = computeCenterRows();
+  drawCenterPerPlayerRows(rows);
+  drawSharedScore();
+  drawOverlay();
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+function getName(id){ const p = state.players.find(pp=>pp.id===id); return p? p.name : id; }
+
+// ===================== 服务器消息（模拟） =====================
+function server_onSeat(message){
+  const { me, seat } = message; // seat: [{id,name}...] 按逆时针
+  state.players = seat.map(s=>({ id:s.id, name:s.name, avatarColor: hashColorFromName(s.name) }));
+  state.seatOrder = seat.map(s=>s.id);
+  state.me = me;
+  // 初始化容器
+  for (const id of state.seatOrder){
+    state.hands.set(id, []);
+    state.process.set(id, []);
+    state.discards.set(id, []);
+    state.personalScores.set(id, []);
+  }
+  state.sharedScore = [];
+  state.currentTurn = state.seatOrder[0];
+  log('收到座次，已布局');
+}
+
+function server_onPlay({from, cards}){
+  // 出牌 → 放入该玩家处理区
+  const hand = state.hands.get(from)||[];
+  // 若来自服务端直接指定了卡面，就直接放；否则从他的手牌移除匹配数量
+  const moved = [];
+  for (let i=0;i<cards.length;i++){
+    const c = hand.length ? hand.pop() : randomCard();
+    moved.push(c);
+  }
+  state.process.get(from).push(...moved);
+  log(`${getName(from)} 出了 ${moved.length} 张牌 → 处理区`);
+}
+
+function server_onRoundResolve(actions){
+  // 将处理区的牌根据 actions 移动到目标处
+  // actions: [{from, to:'discard'|'personal'|'shared', targetId?}]
+  actions.forEach(act=>{
+    const pile = state.process.get(act.from)||[];
+    const moved = pile.splice(0, pile.length);
+    if (act.to==='discard') (state.discards.get(act.targetId||act.from)).push(...moved);
+    else if (act.to==='personal') (state.personalScores.get(act.targetId||act.from)).push(...moved);
+    else if (act.to==='shared') state.sharedScore.push(...moved);
+  });
+  log('一轮结算完成：处理区 → 指定得分/弃牌');
+}
+
+function server_onTurn(nextId){ state.currentTurn = nextId; log(`轮到 ${getName(nextId)} 出牌`); }
+
+// ===================== 本地操作（触发模拟） =====================
+function playCardFromHand(index){
+  const hand = state.hands.get(state.me)||[];
+  if (index<0 || index>=hand.length) return;
+  const [card] = hand.splice(index,1);
+  state.process.get(state.me).push(card);
+  log(`你出了 ${card.suit}${card.rank} → 处理区`);
+}
+function shuffleMyHand(){ const hand = state.hands.get(state.me)||[]; for(let i=hand.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; [hand[i],hand[j]]=[hand[j],hand[i]]; } }
+function dealTo(id, n=1){ const arr = state.hands.get(id)||[]; for(let i=0;i<n;i++) arr.push(randomCard()); }
+
+// ===================== Demo：初始化与按钮 =====================
+function mockSeatMsg(){
+  server_onSeat({
+    me: 'p_you',
+    seat: [
+      {id:'p_you', name:'你'},
+      {id:'p_a', name:'阿青'},
+      {id:'p_b', name:'小李'},
+      {id:'p_c', name:'Dora'},
+      {id:'p_d', name:'Mika'},
+      {id:'p_e', name:'张三'}
+    ]
+  });
+  // 发些初始手牌
+  state.seatOrder.forEach(id=>dealTo(id, id==='p_you'? 7 : 5));
+}
+
+function nextTurn(){
+  if (!state.currentTurn) return; const idx = state.seatOrder.indexOf(state.currentTurn);
+  server_onTurn(state.seatOrder[(idx+1)%state.seatOrder.length]);
+}
+function dealToMe(){ if (!state.me) return; dealTo(state.me, 2); }
+function mockOthersPlay(){
+  if (!state.seatOrder.length) return;
+  const others = state.seatOrder.filter(id=>id!==state.me);
+  const pick = others[(Math.random()*others.length)|0];
+  server_onPlay({from: pick, cards:[randomCard(), randomCard()]});
+}
+function mockRoundResolve(){
+  if (!state.seatOrder.length) return;
+  const actions = state.seatOrder.map(id=>{
+    const r = Math.random();
+    if (r < 0.34) return {from:id, to:'discard', targetId:id};
+    if (r < 0.67) return {from:id, to:'personal', targetId:id};
+    return {from:id, to:'shared'};
+  });
+  server_onRoundResolve(actions);
+}
+function toggleSharedScore(){ state.overlay = {title:'中间得分区', cards:[...state.sharedScore]}; }
+
+// 初始演示
+mockSeatMsg();
+log('已加载 Demo。你可以通过左侧按钮模拟服务器消息\n并在画布上查看与交互。');
+
+</script>
+</body>
+</html>

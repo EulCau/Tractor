@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>卡牌游戏前端（画板实现）</title>
+  <style>
+    html,body{height:100%;margin:0;font-family:system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial}
+    #app{height:100%;display:flex;flex-direction:column}
+    #toolbar{padding:8px;background:linear-gradient(180deg,#0f172a,#071020);color:#fff;display:flex;gap:8px;align-items:center}
+    #canvas-wrap{flex:1;position:relative;background:linear-gradient(180deg,#e8f0ff,#f8fbff)}
+    canvas{width:100%;height:100%;display:block}
+    .panel{position:absolute;left:8px;top:8px;background:rgba(255,255,255,0.85);padding:8px;border-radius:8px}
+    button{padding:6px 10px;border-radius:6px;border:none;background:#2563eb;color:#fff}
+    input,select{padding:6px;border-radius:6px;border:1px solid #ddd}
+    /* 简单的弹出卡片预览 */
+    #preview{position:absolute;right:8px;top:8px;background:rgba(0,0,0,0.7);color:#fff;padding:8px;border-radius:8px;display:none}
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="toolbar">
+      用户名：<input id="username" placeholder="输入用户名" />
+      模式：<select id="mode"></select>
+      <button id="connect">连接并加入</button>
+      <span id="status" style="margin-left:12px;color:#9ca3af"></span>
+    </div>
+    <div id="canvas-wrap">
+      <canvas id="board"></canvas>
+      <div id="preview"></div>
+    </div>
+  </div>
+
+<script>
+// 这个文件实现：
+// - 连接到 ws://localhost:8080（如需改地址请在顶部修改）
+// - 接收服务端 players 列表并按逆时针排列（我们把收到的顺序视为座次顺序），将自己放在右下
+// - 头像由用户名生成纯色 (hash * 大素数) % 0xFFFFFF
+// - 邻近两位显示在屏幕两侧中上位置，其余在顶部行分布并自适应留白
+// - 自己的手牌在屏幕下方展开，其他人的手牌背面重叠放在头像附近
+// - 每人有弃牌区（中间两侧一组），点击会弹出小窗展示弃牌
+// - 中央为公共得分区，点击也展示
+// - 处理区靠近弃牌堆显示，出牌阶段由服务端控制，前端只是渲染收到的事件
+// - 鼠标滑过卡牌会高亮（hover）
+
+const WS_ADDR = 'ws://localhost:8080';
+const canvas = document.getElementById('board');
+const ctx = canvas.getContext('2d');
+const modeSelect = document.getElementById('mode');
+const usernameInput = document.getElementById('username');
+const connectBtn = document.getElementById('connect');
+const statusSpan = document.getElementById('status');
+const preview = document.getElementById('preview');
+
+let ws = null;
+let modes = {};
+let state = {
+  players: [], // usernames in server order
+  ready: [],
+  starter: null,
+  self: null,
+  hands: {}, // username -> array of cards (ints)
+  discards: {}, // username -> array
+  processing: {}, // username -> array (cards in processing area)
+  scores: {}, // username -> score number
+  centerScore: [],
+  hovered: null // {user, idx, rect}
+};
+
+function fitCanvas(){
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.clientWidth * dpr;
+  canvas.height = canvas.clientHeight * dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener('resize', ()=>{fitCanvas(); draw();});
+fitCanvas();
+
+// helpers
+function hashUsername(u){
+  // 简单哈希
+  let h = 2166136261 >>> 0;
+  for (let i=0;i<u.length;i++) h = Math.imul(h ^ u.charCodeAt(i), 16777619) >>> 0;
+  return h;
+}
+function usernameToColor(u){
+  const h = hashUsername(u);
+  const col = (Math.imul(h, 2654435761) >>> 0) & 0xFFFFFF;
+  return '#' + col.toString(16).padStart(6,'0');
+}
+
+function cardRank(card){ // 0..12
+  const r = card % 13;
+  const names = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+  return names[r];
+}
+function cardSuit(card){ // 0..3
+  const s = Math.floor(card/13) % 4;
+  return ['♠','♥','♦','♣'][s];
+}
+function cardLabel(card){return cardRank(card)+cardSuit(card);} 
+
+// layout algorithm
+function computeLayout(){
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  const players = state.players.slice();
+  const n = players.length;
+  const selfIndex = players.indexOf(state.self);
+  let order = [];
+  if (selfIndex >=0){
+    // rotate so self is first
+    for (let i=0;i<n;i++) order.push(players[(selfIndex + i) % n]);
+  } else order = players;
+
+  // positions map username -> {x,y,avatarR}
+  const pos = {};
+  // self at bottom-right offset
+  const margin = Math.min(40, W*0.03);
+  const avatarR = Math.min(36, Math.max(24, W*0.04));
+  const selfX = W - margin - avatarR; const selfY = H - margin - avatarR;
+  if (order.length>0) pos[order[0]] = {x:selfX,y:selfY,r:avatarR,anchor:'br'};
+
+  if (order.length>1){
+    // neighbor to left side middle-up
+    const leftX = margin + avatarR; const leftY = H*0.35;
+    pos[order[1]] = {x:leftX,y:leftY,r:avatarR,anchor:'ml'};
+  }
+  if (order.length>2){
+    // neighbor to right side middle-up
+    const rightX = W - margin - avatarR; const rightY = H*0.35;
+    pos[order[order.length-1]] = {x:rightX,y:rightY,r:avatarR,anchor:'mr'};
+  }
+  // others: place evenly across top between left and right with some white padding
+  const topPlayers = order.slice(2, Math.max(2, order.length-1));
+  const topCount = topPlayers.length;
+  const leftPad = Math.min(100, W*0.06);
+  const rightPad = leftPad;
+  for (let i=0;i<topCount;i++){
+    const t = i/(Math.max(1, topCount-1));
+    const x = leftPad + t*(W-leftPad-rightPad);
+    const y = Math.max(margin + avatarR, H*0.12 + Math.abs(Math.sin(i))*10);
+    pos[topPlayers[i]] = {x, y, r: avatarR, anchor:'mt'};
+  }
+
+  return pos;
+}
+
+function drawCardFace(x,y,w,h,card,face=true,highlight=false){
+  const radius = 6;
+  // card background
+  ctx.save();
+  ctx.beginPath();
+  roundRect(ctx,x,y,w,h,radius);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  if (highlight){
+    ctx.lineWidth = 3; ctx.strokeStyle = '#f59e0b'; ctx.stroke();
+  } else { ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(0,0,0,0.08)'; ctx.stroke(); }
+
+  if (!face){
+    // back design: light blue with simple pattern; provide placeholder for texture
+    ctx.fillStyle = '#dbeafe';
+    ctx.fill();
+    // placeholder for texture: comment where to plug in image
+    // TODO: drawImage(texture, x+4, y+4, w-8, h-8)
+    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.font = Math.floor(h*0.16) + 'px serif';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText('牌背', x+w/2, y+h/2);
+    ctx.restore();
+    return;
+  }
+
+  // face: show corner labels and maybe a center big suit
+  ctx.fillStyle = '#111827';
+  const cornerFont = Math.floor(h*0.12) + 'px serif';
+  ctx.font = cornerFont;
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText(cardRank(card) + ' ' + cardSuit(card), x+6, y+4);
+  ctx.save();
+  ctx.translate(x+w-6, y+h-4);
+  ctx.rotate(Math.PI);
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText(cardRank(card) + ' ' + cardSuit(card), 0, 0);
+  ctx.restore();
+  // big center suit
+  ctx.font = Math.floor(h*0.38) + 'px serif';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(cardSuit(card), x+w/2, y+h/2);
+  ctx.restore();
+}
+
+function roundRect(ctx,x,y,w,h,r){
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+function draw(){
+  fitCanvas();
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  // background subtle pattern
+  drawBackground(W,H);
+
+  const pos = computeLayout();
+
+  // draw central areas: center score and discard stacks on two sides
+  const centerW = Math.min(300, W*0.18);
+  const centerH = Math.min(140, H*0.18);
+  const cx = W/2, cy = H/2;
+  // center score box
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.strokeStyle = 'rgba(0,0,0,0.06)';
+  roundRect(ctx, cx-centerW/2, cy-centerH/2, centerW, centerH, 10);
+  ctx.fill(); ctx.stroke();
+  ctx.font = '14px sans-serif'; ctx.fillStyle='#111827'; ctx.textAlign='center'; ctx.fillText('得分区 (点击查看)', cx, cy);
+
+  // discard columns left & right for players (small stack per player)
+  const discColW = Math.min(120, W*0.11);
+  const discColH = Math.min(H*0.6, H-120);
+  const leftX = cx - centerW/2 - 20 - discColW; const rightX = cx + centerW/2 + 20;
+  const players = state.players.slice();
+  const n = players.length;
+  // draw each player's avatar and regions
+  const layout = pos;
+  // draw top players first so avatars overlay cards nicely
+  for (let u of players){
+    const p = layout[u];
+    if (!p) continue;
+    drawAvatar(u, p.x, p.y, p.r);
+  }
+
+  // draw other players' backs and own hand
+  for (let u of players){
+    const p = layout[u]; if (!p) continue;
+    // compute discard index for column
+    const idx = players.indexOf(u);
+    const colY = cy - discColH/2 + (discColH/(n+1))*(idx+1);
+    // discard stack small rect
+    const dW = 48, dH=64;
+    const dXleft = leftX + (discColW-dW)/2; const dXright = rightX + (discColW-dW)/2;
+    // choose left or right based on index parity to spread
+    const dX = (idx%2===0)? dXleft : dXright;
+    // store region metadata for click
+    if (!state._regions) state._regions={};
+    state._regions['discard_'+u] = {x:dX,y:colY-dH/2,w:dW,h:dH, user:u};
+    // draw discard top card or placeholder
+    ctx.save(); roundRect(ctx,dX,dX?colY-dH/2:0,dW,dH,6);
+    ctx.fillStyle = '#f3f4f6'; ctx.strokeStyle='rgba(0,0,0,0.06)';
+    ctx.beginPath(); roundRect(ctx,dX,colY-dH/2,dW,dH,6); ctx.fill(); ctx.stroke();
+    const disc = state.discards[u]||[];
+    if (disc.length>0) drawCardFace(dX, colY-dH/2, dW, dH, disc[disc.length-1], true);
+    else{ ctx.fillStyle='rgba(0,0,0,0.06)'; ctx.font='12px sans-serif'; ctx.textAlign='center'; ctx.fillText('弃牌', dX+dW/2, colY); }
+    ctx.restore();
+
+    // processing area next to discard
+    const pW = 60, pH = 80;
+    const pX = dX + (idx%2===0 ? dW + 8 : -pW - 8);
+    const pY = colY - pH/2;
+    state._regions['proc_'+u] = {x:pX,y:pY,w:pW,h:pH,user:u};
+    ctx.save(); ctx.beginPath(); roundRect(ctx,pX,pY,pW,pH,6); ctx.fillStyle='rgba(255,255,255,0.85)'; ctx.fill(); ctx.strokeStyle='rgba(0,0,0,0.06)'; ctx.stroke(); ctx.restore();
+    const proc = state.processing[u]||[];
+    if (proc.length>0) drawCardFace(pX+4,pY+4,pW-8,pH-8,proc[proc.length-1],true);
+
+    // score area next to processing
+    const sW=48,sH=28;
+    const sX = pX + (idx%2===0 ? 0 : pW + 8);
+    const sY = pY + pH + 6;
+    state._regions['score_'+u] = {x:sX,y:sY,w:sW,h:sH,user:u};
+    ctx.save(); ctx.fillStyle='rgba(255,255,255,0.95)'; ctx.beginPath(); roundRect(ctx,sX,sY,sW,sH,6); ctx.fill(); ctx.strokeStyle='rgba(0,0,0,0.06)'; ctx.stroke(); ctx.fillStyle='#111827'; ctx.font='12px sans-serif'; ctx.textAlign='center'; ctx.fillText((state.scores[u]||0)+' 分', sX+sW/2, sY+sH/2+4); ctx.restore();
+  }
+
+  // draw hands: own hand expanded bottom-left of avatar; others show backs overlapping near avatar
+  for (let u of players){
+    const p = layout[u]; if (!p) continue;
+    const hand = state.hands[u] || [];
+    const cardW = Math.min(72, Math.max(42, canvas.clientWidth*0.06));
+    const cardH = Math.round(cardW*1.4);
+
+    if (u === state.self){
+      // place to left of avatar along bottom
+      const baseX = p.x - (cardW+8) - 12; const baseY = p.y - cardH/2;
+      const gap = Math.min(cardW*0.4, (canvas.clientWidth-120)/(hand.length+1));
+      for (let i=0;i<hand.length;i++){
+        const x = baseX - (hand.length-1-i)*(gap);
+        const y = Math.min(canvas.clientHeight - cardH - 12, baseY);
+        const key = 'hand_'+u+'_'+i;
+        state._regions[key] = {x,y,w:cardW,h:cardH,user:u,idx:i,face:true,card:hand[i]};
+        drawCardFace(x,y,cardW,cardH,hand[i],true, state.hovered && state.hovered.key===key);
+      }
+    } else {
+      // backs overlapped near avatar
+      const baseX = p.x + (p.anchor==='ml' ? cardW : -cardW);
+      const baseY = p.y + p.r + 8;
+      const overlap = Math.min(14, cardW*0.25);
+      for (let i=0;i<Math.min(hand.length,3);i++){
+        const x = baseX + i*overlap*(p.anchor==='ml'?1:-1);
+        const y = baseY + i*2;
+        const key = 'hand_'+u+'_'+i;
+        state._regions[key] = {x,y,w:cardW,h:cardH,user:u,idx:i,face:false};
+        drawCardFace(x,y,cardW,cardH,hand[hand.length-1-i],false, state.hovered && state.hovered.key===key);
+      }
+    }
+  }
+
+}
+
+function drawAvatar(name,x,y,r){
+  // circle avatar with initials
+  ctx.save();
+  ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.closePath();
+  ctx.fillStyle = usernameToColor(name);
+  ctx.fill();
+  ctx.fillStyle='rgba(255,255,255,0.9)'; ctx.font = Math.floor(r*0.8)+'px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  const initials = name.split(/[ _]/).map(s=>s[0]).slice(0,2).join('').toUpperCase();
+  ctx.fillText(initials, x, y);
+  ctx.strokeStyle='rgba(0,0,0,0.08)'; ctx.stroke();
+  // draw username under avatar small
+  ctx.fillStyle='#0f172a'; ctx.font = Math.floor(r*0.4)+'px sans-serif'; ctx.textAlign='center'; ctx.fillText(name, x, y + r + 12);
+  ctx.restore();
+}
+
+function drawBackground(W,H){
+  // subtle diagonal pattern
+  ctx.save();
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#f8fbff'); g.addColorStop(1,'#eef6ff');
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  // ornamental corner waves (simple)
+  ctx.globalAlpha = 0.06;
+  ctx.fillStyle = '#2563eb';
+  ctx.beginPath(); ctx.ellipse(W*0.15,H*0.85,W*0.6,H*0.35, -0.4,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+// interaction
+canvas.addEventListener('mousemove', (ev)=>{
+  const rect = canvas.getBoundingClientRect();
+  const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+  let found = null;
+  if (state._regions){
+    for (let k in state._regions){
+      const r = state._regions[k];
+      if (x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h){ found = {key:k,meta:r}; break; }
+    }
+  }
+  state.hovered = found;
+  if (found){
+    // show tiny preview
+    preview.style.display='block'; preview.style.right='8px'; preview.style.top=(ev.clientY - 40)+'px';
+    if (found.key.startsWith('hand_')){
+      const info = found.meta;
+      if (info.face) preview.innerText = cardLabel(info.card || 0);
+      else preview.innerText = '牌背';
+    } else if (found.key.startsWith('discard_')) preview.innerText = '点击查看弃牌';
+    else if (found.key.startsWith('score_')) preview.innerText = '点击查看得分';
+  } else preview.style.display='none';
+  draw();
+});
+canvas.addEventListener('click', (ev)=>{
+  if (!state._regions) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+  for (let k in state._regions){
+    const r = state._regions[k];
+    if (x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h){
+      if (k.startsWith('discard_')){
+        const user = r.user; showCardsDialog(user, state.discards[user]||[],'弃牌 - '+user);
+      } else if (k.startsWith('score_')){
+        const user=r.user; alert((user?user+' 得分: ':'公共得分: ')+JSON.stringify(state.scores[user]||0));
+      } else if (k.startsWith('proc_')){
+        const user=r.user; showCardsDialog(user, state.processing[user]||[],'处理区 - '+user);
+      }
+      break;
+    }
+  }
+});
+
+function showCardsDialog(user, list, title){
+  // 简单展示
+  const txt = list.map((c,i)=>`${i+1}. ${cardLabel(c)}`).join('\n');
+  alert(title+'\n\n'+(txt||'空'));
+}
+
+// websocket and messages
+function connectWS(name, mode){
+  ws = new WebSocket(WS_ADDR);
+  ws.onopen = ()=>{ statusSpan.innerText='已连接'; ws.send(JSON.stringify({mode, type:'join', username:name})); };
+  ws.onmessage = (m)=>{ try{ const d = JSON.parse(m.data); handleMessage(d); }catch(e){console.error(e);} };
+  ws.onclose = ()=>{ statusSpan.innerText='已断开'; };
+}
+
+function handleMessage(d){
+  if (d.event === 'modes'){ modes = d.modes; rebuildModes(); }
+  if (d.event === 'update'){
+    state.players = d.players || [];
+    // ensure structures exist
+    for (let p of state.players){ state.hands[p]=state.hands[p]||[]; state.discards[p]=state.discards[p]||[]; state.processing[p]=state.processing[p]||[]; state.scores[p]=state.scores[p]||0; }
+    draw();
+  }
+  if (d.event === 'hand'){
+    // from testGame: {event:'hand', seat, hand}
+    // assign to username by matching seat order from last update? Here testGame set seat per clients order when starting; we can't map seat->username reliably unless server sends mapping. But testGame sends to each client individually; our server forwarded that? In practice we'll assign hand to current ws.username.
+    if (d.hand){ state.hands[state.self]=d.hand; draw(); }
+  }
+  if (d.event === 'game_start'){
+    console.log('game_start', d.msg);
+  }
+  // custom: handle play/discard messages (not implemented server-side in sample). Example shape:
+  // {event:'play', user:'bob', cards:[12,3], target:'proc'}
+  if (d.event === 'play'){
+    const user=d.user; const cards=d.cards||[]; const target=d.target;
+    if (target==='proc') state.processing[user]=(state.processing[user]||[]).concat(cards);
+    if (target==='discard') state.discards[user]=(state.discards[user]||[]).concat(cards);
+    if (target==='score') state.scores[user]=(state.scores[user]||0)+ (d.points||0);
+    draw();
+  }
+}
+
+function rebuildModes(){
+  modeSelect.innerHTML='';
+  for (let k in modes){ const opt = document.createElement('option'); opt.value=k; opt.innerText = modes[k].name + ' ('+k+')'; modeSelect.appendChild(opt);} }
+
+connectBtn.addEventListener('click', ()=>{
+  const name = usernameInput.value.trim();
+  const mode = modeSelect.value;
+  if (!name){ alert('请输入用户名'); return; }
+  state.self = name; state.players = state.players || [];
+  connectWS(name, mode);
+});
+
+// init draw loop
+setInterval(()=>{ draw(); }, 600);
+
+// initial dummy state for easy visual testing (remove/comment if you want live only)
+(function seed(){
+  state.self = state.self || '你';
+  state.players = ['你','Alice','Bob','Carol','Dave','Eve'];
+  state.hands['你'] = [0,12,25,38,51];
+  state.hands['Alice'] = [3,7,22,50];
+  state.hands['Bob'] = [4,5,6];
+  state.discards['Bob'] = [10,11];
+  state.processing['Carol'] = [2];
+  state.scores['Dave'] = 12;
+  draw();
+})();
+
+</script>
+</body>
+</html>
