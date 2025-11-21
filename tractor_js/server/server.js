@@ -6,7 +6,7 @@ const wss = new WebSocket.Server({ port: 8080 });
 const gameModes = {
     tractor: { name: "拖拉机", minPlayers: 4, maxPlayers: 6 },
     holdem: { name: "德州扑克", minPlayers: 2, maxPlayers: 9 },
-    test: { name: "测试", minPlayers: 2, maxPlayers: 4 },
+    test: { name: "测试", minPlayers: 1, maxPlayers: 4 },
 };
 
 let rooms = {};
@@ -23,6 +23,14 @@ wss.on("connection", (ws) => {
         const data = JSON.parse(msg);
         const mode = data.mode;
 
+        if (data.type === "get_modes") {
+            ws.send(JSON.stringify({
+                event: "modes",
+                modes: gameModes
+            }));
+            return;
+        }
+
         if (!gameModes[mode]) {
             ws.send(JSON.stringify({ event: "error", msg: `无效的游戏模式: ${mode}` }));
             return;
@@ -35,10 +43,10 @@ wss.on("connection", (ws) => {
         }
 
         if (data.type === "ready") {
-            if (!rooms[mode].ready.includes(ws)) {
-                rooms[mode].ready.push(ws);
+            if (!rooms[mode].ready.includes(ws.username)) {
+                rooms[mode].ready.push(ws.username);
                 if (!rooms[mode].starter) {
-                    rooms[mode].starter = ws; // 第一个准备的人
+                    rooms[mode].starter = ws.username; // 第一个准备的人
                 }
             }
             broadcast(mode);
@@ -47,23 +55,20 @@ wss.on("connection", (ws) => {
         if (data.type === "start") {
             const config = gameModes[mode];
             const room = rooms[mode];
-            const readyPlayers = room.ready;
 
             // 只有 starter 能点开始
-            if (ws !== room.starter) {
+            if (ws.username !== room.starter) {
                 ws.send(JSON.stringify({ event: "error", msg: "只有第一个准备的人能开始游戏" }));
                 return;
             }
 
-            let selectedPlayers = readyPlayers;
+            let selectedPlayers = room.players.filter(p => room.ready.includes(p.username));
             if (data.selectedUsernames) {
-                selectedPlayers = readyPlayers.filter(p => data.selectedUsernames.includes(p.username));
+                selectedPlayers = selectedPlayers.filter(p => data.selectedUsernames.includes(p.username));
             }
 
-            if (
-                selectedPlayers.length >= config.minPlayers &&
-                selectedPlayers.length <= config.maxPlayers
-            ) {
+            if (selectedPlayers.length >= config.minPlayers &&
+                selectedPlayers.length <= config.maxPlayers) {
                 gameManager.startGame(mode, selectedPlayers, () => {
                     broadcast(mode, {
                         event: "game_start",
@@ -94,7 +99,7 @@ function broadcast(mode, extra = {}) {
     const message = {
         event: "update",
         players: room.players.map(p => p.username),
-        ready: room.ready.map(p => p.username),
+        ready: room.ready,
         starter: room.starter ? room.starter.username : null,
         ...extra,
     };

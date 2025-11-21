@@ -18,9 +18,14 @@ export default function App() {
         const socket = new WebSocket("ws://localhost:8080");
         setWs(socket);
 
+        socket.onopen = () => {
+            socket.send(JSON.stringify({ type: "get_modes" }));
+        };
+
         socket.onmessage = (event) => {
             const data = JSON.parse(event.data);
             if (data.event === "modes") {
+                console.log("收到 modes:", data.modes);
                 setModes(data.modes);
             }
             if (data.event === "update") {
